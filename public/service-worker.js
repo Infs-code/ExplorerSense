@@ -1,4 +1,4 @@
-const CACHE = "explorer-sense-shell-v5";
+const CACHE = "explorer-sense-shell-v6";
 const BASE = self.registration.scope;
 const SHELL = [BASE, new URL("manifest.webmanifest", BASE).href, new URL("icon.svg", BASE).href];
 
@@ -18,6 +18,19 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   const basePath = new URL(BASE).pathname;
   if (request.method !== "GET" || url.origin !== self.location.origin || url.pathname.startsWith("/api/") || url.pathname.startsWith(`${basePath}api/`)) return;
+
+  if (request.mode === "navigate") {
+    event.respondWith(
+      fetch(new Request(request, { cache: "reload" })).then((response) => {
+        if (response.ok) {
+          event.waitUntil(caches.open(CACHE).then((cache) => cache.put(BASE, response.clone())).catch(() => undefined));
+        }
+        return response;
+      }).catch(() => caches.match(request).then((cached) => cached ?? caches.match(BASE))),
+    );
+    return;
+  }
+
   event.respondWith(
     caches.match(request).then((cached) => {
       const network = fetch(request).then((response) => {
