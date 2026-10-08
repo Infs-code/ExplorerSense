@@ -1,0 +1,474 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { browserCapabilities } from "./diagnostics/capabilities.js";
+import { detectStarsOffThread } from "./camera/detectStarsWorker.js";
+import { fitAttitude, rotateVector } from "./calibration/attitude.js";
+import { observingConditions } from "./astronomy/conditions.js";
+import { bodyPosition } from "./astronomy/coordinates.js";
+import { approximateTrueFieldDeg, exitPupilMm, magnification } from "./astronomy/optics.js";
+import { raDecToVector, angularSeparationDeg } from "./astronomy/vectors.js";
+import { loadOpenNgcCatalog } from "./catalog/load.js";
+import { searchTargets } from "./catalog/targets.js";
+import { solveThroughAstrometryProxy } from "./plateSolver/astrometryNet.js";
+import { pixelToSky, skyToPixel } from "./plateSolver/wcs.js";
+import { pointingGuidance } from "./pointing/guidance.js";
+import { deleteCalibration, loadCalibration, loadTelescopeConfig, saveCalibration, saveTelescopeConfig } from "./storage/local.js";
+const capabilityList = browserCapabilities();
+const initialTarget = searchTargets("M31")[0];
+const deg = (value) => `${value >= 0 ? "+" : "−"}${Math.abs(value).toFixed(2)}°`;
+const moonPhaseName = (angleDeg) => ["New moon", "Waxing crescent", "First quarter", "Waxing gibbous", "Full moon", "Waning gibbous", "Third quarter", "Waning crescent"][Math.floor(((angleDeg + 22.5) % 360) / 45)] ?? "N/A";
+const localEventTime = (date) => date ? date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : "No event in 48 h";
+function App() {
+    const videoRef = useRef(null);
+    const canvasRef = useRef(null);
+    const streamRef = useRef(null);
+    const abortRef = useRef(null);
+    const [cameraState, setCameraState] = useState("idle");
+    const [cameraMessage, setCameraMessage] = useState("Camera has not been requested.");
+    const [location, setLocation] = useState(null);
+    const [locationMessage, setLocationMessage] = useState("Location not requested.");
+    const [selected, setSelected] = useState(initialTarget);
+    const [search, setSearch] = useState("");
+    const [solution, setSolution] = useState(null);
+    const [solveMessage, setSolveMessage] = useState("No plate solution yet.");
+    const [solveBusy, setSolveBusy] = useState(false);
+    const [uploadConsent, setUploadConsent] = useState(false);
+    const [detection, setDetection] = useState(null);
+    const [frameUrl, setFrameUrl] = useState(null);
+    const [calibrationPixel, setCalibrationPixel] = useState(null);
+    const [calibrationMarker, setCalibrationMarker] = useState(null);
+    const [validation, setValidation] = useState(null);
+    const [calibrationPoints, setCalibrationPoints] = useState([]);
+    const [fit, setFit] = useState(null);
+    const [telescope, setTelescope] = useState({ apertureMm: null, focalLengthMm: null, eyepieceMm: null, eyepieceApparentFieldDeg: null });
+    const [storageReady, setStorageReady] = useState(false);
+    const [online, setOnline] = useState(navigator.onLine);
+    const [tab, setTab] = useState("guide");
+    const [catalogObjects, setCatalogObjects] = useState([]);
+    const [catalogState, setCatalogState] = useState("idle");
+    const [catalogError, setCatalogError] = useState("");
+    const [now, setNow] = useState(new Date());
+    const matchingTargets = useMemo(() => searchTargets(search, catalogObjects), [search, catalogObjects]);
+    const visibleTargets = matchingTargets.slice(0, 50);
+    const conditions = useMemo(() => location ? observingConditions(selected, location, now) : null, [location, selected, now]);
+    const targetEquatorial = useMemo(() => {
+        if (selected.body) {
+            if (!location)
+                return null;
+            const position = bodyPosition(selected.body, location, now).j2000;
+            return { ra: position.raDeg / 15, dec: position.decDeg };
+        }
+        return selected.raDeg !== null && selected.decDeg !== null ? { ra: selected.raDeg / 15, dec: selected.decDeg } : null;
+    }, [location, now, selected]);
+    const guide = useMemo(() => {
+        if (!solution || !fit || fit.retainedIndexes.length < 5 || !validation || validation.residualDeg > 0.5 || !targetEquatorial)
+            return null;
+        const target = raDecToVector(targetEquatorial.ra * 15, targetEquatorial.dec);
+        return pointingGuidance(raDecToVector(solution.raDeg, solution.decDeg), target, fit.quaternion);
+    }, [solution, fit, targetEquatorial, calibrationPoints.length, validation]);
+    useEffect(() => {
+        let active = true;
+        void Promise.all([loadCalibration(), loadTelescopeConfig()]).then(([saved, config]) => {
+            if (!active)
+                return;
+            if (saved) {
+                setFit(saved);
+                setCalibrationPoints(saved.points);
+            }
+            setTelescope(config);
+            setStorageReady(true);
+        });
+        const timer = window.setInterval(() => setNow(new Date()), 30_000);
+        const updateOnline = () => setOnline(navigator.onLine);
+        window.addEventListener("online", updateOnline);
+        window.addEventListener("offline", updateOnline);
+        return () => {
+            active = false;
+            window.clearInterval(timer);
+            window.removeEventListener("online", updateOnline);
+            window.removeEventListener("offline", updateOnline);
+            streamRef.current?.getTracks().forEach((track) => track.stop());
+            abortRef.current?.abort();
+        };
+    }, []);
+    useEffect(() => {
+        if (tab !== "targets" || catalogState !== "idle")
+            return;
+        setCatalogState("loading");
+        void loadOpenNgcCatalog().then((catalog) => {
+            setCatalogObjects(catalog);
+            setCatalogState("ready");
+        }).catch((error) => {
+            setCatalogError(error instanceof Error ? error.message : "The offline object catalog could not be loaded.");
+            setCatalogState("error");
+        });
+    }, [catalogState, tab]);
+    useEffect(() => {
+        if (storageReady)
+            void saveTelescopeConfig(telescope);
+    }, [storageReady, telescope]);
+    async function startCamera() {
+        if (!navigator.mediaDevices?.getUserMedia) {
+            setCameraState("error");
+            setCameraMessage("Camera is unavailable. Open this app over HTTPS in a supported browser.");
+            return;
+        }
+        setCameraState("starting");
+        setCameraMessage("Waiting for camera permission…");
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: false,
+                video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 15, max: 30 } },
+            });
+            streamRef.current?.getTracks().forEach((track) => track.stop());
+            streamRef.current = stream;
+            if (videoRef.current) {
+                videoRef.current.srcObject = stream;
+                await videoRef.current.play();
+            }
+            setCameraState("ready");
+            const track = stream.getVideoTracks()[0];
+            setCameraMessage(`Rear-camera stream active${track?.getSettings().width ? ` · ${track.getSettings().width}×${track.getSettings().height}` : ""}.`);
+        }
+        catch (error) {
+            const name = error instanceof DOMException ? error.name : "Error";
+            setCameraState("error");
+            setCameraMessage(name === "NotAllowedError" ? "Camera permission was denied. Enable camera access for this site in Safari settings." : name === "NotFoundError" ? "No camera was found on this device." : `Camera could not start (${name}). Close other camera apps and try again.`);
+        }
+    }
+    function stopCamera() {
+        streamRef.current?.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+        if (videoRef.current)
+            videoRef.current.srcObject = null;
+        setCameraState("idle");
+        setCameraMessage("Camera stopped.");
+    }
+    function requestLocation() {
+        if (!navigator.geolocation) {
+            setLocationMessage("This browser does not provide geolocation.");
+            return;
+        }
+        setLocationMessage("Waiting for location permission…");
+        navigator.geolocation.getCurrentPosition((position) => {
+            const value = { latitudeDeg: position.coords.latitude, longitudeDeg: position.coords.longitude, elevationMeters: position.coords.altitude ?? 0, accuracyMeters: position.coords.accuracy };
+            setLocation(value);
+            setLocationMessage(`Location available · ±${Math.round(position.coords.accuracy)} m accuracy. Used in this session only.`);
+        }, (error) => setLocationMessage(error.code === error.PERMISSION_DENIED ? "Location permission denied. Visibility calculations are unavailable." : "Location unavailable. Check device location settings and retry."), { enableHighAccuracy: true, maximumAge: 0, timeout: 15_000 });
+    }
+    async function captureFrame() {
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+        if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth || !video.videoHeight)
+            return null;
+        const scale = Math.min(1, 1280 / video.videoWidth, 960 / video.videoHeight);
+        const width = Math.max(1, Math.round(video.videoWidth * scale));
+        const height = Math.max(1, Math.round(video.videoHeight * scale));
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context)
+            return null;
+        context.drawImage(video, 0, 0, width, height);
+        const image = context.getImageData(0, 0, width, height);
+        const url = canvas.toDataURL("image/jpeg", 0.92);
+        setSolution(null);
+        setFrameUrl(url);
+        const stars = await detectStarsOffThread(image);
+        setDetection(stars);
+        setCalibrationPixel(null);
+        setCalibrationMarker(null);
+        return { imageBase64: url, width, height, detection: stars };
+    }
+    async function scanFrame() {
+        const captured = await captureFrame();
+        if (!captured) {
+            setSolveMessage("Camera frame is not ready. Wait for live video, then scan again.");
+            return;
+        }
+        setSolveMessage(`${captured.detection.stars.length} star-like sources detected in this frame. No plate solution has been attempted.`);
+    }
+    async function solveFrame() {
+        if (!uploadConsent) {
+            setSolveMessage("Confirm the upload disclosure before sending a still frame.");
+            return;
+        }
+        const captured = await captureFrame();
+        if (!captured) {
+            setSolveMessage("Camera frame is not ready. Wait for live video, then try again.");
+            return;
+        }
+        abortRef.current?.abort();
+        const controller = new AbortController();
+        abortRef.current = controller;
+        setSolveBusy(true);
+        try {
+            setSolveMessage("Submitting one still image through the configured solve backend. The service may retain submitted data under its terms.");
+            const result = await solveThroughAstrometryProxy(captured.imageBase64, captured.width, captured.height, setSolveMessage, controller.signal);
+            setSolution(result);
+            setSolveMessage("Solved by Astrometry.net. Center/scale/orientation are the service result; camera distortion is not modeled in this WCS.");
+        }
+        catch (error) {
+            setSolveMessage(error instanceof Error ? error.message : "Plate solve failed.");
+        }
+        finally {
+            setSolveBusy(false);
+        }
+    }
+    function addCalibrationPoint() {
+        if (!solution || !calibrationPixel) {
+            setSolveMessage("First solve a frame, then tap the known object in that still frame so its identity can be checked against the plate solution.");
+            return;
+        }
+        if (selected.body || selected.raDeg === null || selected.decDeg === null)
+            return;
+        if (calibrationPoints.some((point) => point.label.startsWith(`${selected.id} `))) {
+            setSolveMessage("Use a different fixed target for each calibration point so the sample spans the sky.");
+            return;
+        }
+        const cameraCenter = raDecToVector(solution.raDeg, solution.decDeg);
+        const nearestPointDeg = calibrationPoints.reduce((minimum, point) => Math.min(minimum, angularSeparationDeg(point.camera, cameraCenter)), 180);
+        if (calibrationPoints.length > 0 && nearestPointDeg < 15) {
+            setSolveMessage(`This point is only ${nearestPointDeg.toFixed(1)}° from an existing sample. Choose a target farther across the sky to improve the 3D fit.`);
+            return;
+        }
+        const clickedSky = pixelToSky(solution, calibrationPixel.x, calibrationPixel.y);
+        const catalogDirection = raDecToVector(selected.raDeg, selected.decDeg);
+        const matchError = angularSeparationDeg(clickedSky, catalogDirection);
+        if (matchError > Math.max(2, solution.pixelScaleArcsec * Math.hypot(solution.imageWidth, solution.imageHeight) / 7200)) {
+            setSolveMessage(`The clicked source is ${matchError.toFixed(2)}° from the entered catalog position. Check the target identity or plate solution before saving this point.`);
+            return;
+        }
+        const point = {
+            camera: cameraCenter,
+            telescope: catalogDirection,
+            label: `${selected.id} · eyepiece center`,
+            createdAt: new Date().toISOString(),
+        };
+        const updated = [...calibrationPoints, point];
+        setCalibrationPoints(updated);
+        setValidation(null);
+        if (updated.length >= 3) {
+            try {
+                const attitude = fitAttitude(updated);
+                const saved = { points: updated, quaternion: attitude.quaternion, meanDeg: attitude.meanDeg, rmsDeg: attitude.rmsDeg, worstDeg: attitude.worstDeg, retainedIndexes: attitude.retained, savedAt: new Date().toISOString() };
+                setFit(saved);
+                void saveCalibration(saved);
+            }
+            catch (error) {
+                setSolveMessage(error instanceof Error ? error.message : "Calibration fit failed.");
+            }
+        }
+    }
+    function validateCalibration() {
+        if (!fit || !solution || !calibrationPixel || selected.body || selected.raDeg === null || selected.decDeg === null) {
+            setSolveMessage("Solve a frame of a fixed, previously unused target and tap that target in the image before validating.");
+            return;
+        }
+        if (calibrationPoints.some((point) => point.label.startsWith(`${selected.id} `))) {
+            setSolveMessage("Choose a fixed target that was not used in the calibration fit.");
+            return;
+        }
+        const expected = raDecToVector(selected.raDeg, selected.decDeg);
+        const clicked = pixelToSky(solution, calibrationPixel.x, calibrationPixel.y);
+        const identityError = angularSeparationDeg(clicked, expected);
+        const maxIdentityError = Math.max(2, solution.pixelScaleArcsec * Math.hypot(solution.imageWidth, solution.imageHeight) / 7200);
+        if (identityError > maxIdentityError) {
+            setSolveMessage(`The tapped target does not agree with this frame's WCS (${identityError.toFixed(2)}°). Check the plate solution and selected object.`);
+            return;
+        }
+        const measuredScope = rotateVector(fit.quaternion, raDecToVector(solution.raDeg, solution.decDeg));
+        const residualDeg = angularSeparationDeg(measuredScope, expected);
+        setValidation({ targetId: selected.id, residualDeg });
+        setSolveMessage(residualDeg <= 0.5 ? `Independent validation residual: ${residualDeg.toFixed(2)}°.` : `Validation error ${residualDeg.toFixed(2)}°. Phone mount may have moved; recalibration is required before guidance.`);
+    }
+    function selectCalibrationTarget(event) {
+        if (!solution)
+            return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        const scale = Math.max(rect.width / solution.imageWidth, rect.height / solution.imageHeight);
+        const drawnWidth = solution.imageWidth * scale;
+        const drawnHeight = solution.imageHeight * scale;
+        const offsetX = (rect.width - drawnWidth) / 2;
+        const offsetY = (rect.height - drawnHeight) / 2;
+        const x = (event.clientX - rect.left - offsetX) / scale;
+        const y = (event.clientY - rect.top - offsetY) / scale;
+        if (x < 0 || y < 0 || x >= solution.imageWidth || y >= solution.imageHeight)
+            return;
+        setCalibrationPixel({ x, y });
+        const viewRect = event.currentTarget.parentElement?.getBoundingClientRect();
+        if (viewRect)
+            setCalibrationMarker({ x: event.clientX - viewRect.left, y: event.clientY - viewRect.top });
+    }
+    function removeCalibrationPoint(index) {
+        const updated = calibrationPoints.filter((_, itemIndex) => itemIndex !== index);
+        setCalibrationPoints(updated);
+        setValidation(null);
+        if (updated.length >= 3) {
+            try {
+                const attitude = fitAttitude(updated);
+                const saved = { points: updated, quaternion: attitude.quaternion, meanDeg: attitude.meanDeg, rmsDeg: attitude.rmsDeg, worstDeg: attitude.worstDeg, retainedIndexes: attitude.retained, savedAt: new Date().toISOString() };
+                setFit(saved);
+                void saveCalibration(saved);
+            }
+            catch {
+                setFit(null);
+            }
+        }
+        else {
+            setFit(null);
+            void deleteCalibration();
+        }
+    }
+    function clearCalibration() {
+        setCalibrationPoints([]);
+        setFit(null);
+        setValidation(null);
+        void deleteCalibration();
+        setSolveMessage("Calibration cleared. Recalibrate after the phone mount has moved.");
+    }
+    const targetPixel = solution && targetEquatorial ? skyToPixel(solution, raDecToVector(targetEquatorial.ra * 15, targetEquatorial.dec)) : null;
+    const fieldDegrees = solution ? solution.pixelScaleArcsec * Math.max(solution.imageWidth, solution.imageHeight) / 3600 : null;
+    const calculatedMagnification = magnification(telescope.focalLengthMm, telescope.eyepieceMm);
+    const trueFieldDegrees = approximateTrueFieldDeg(telescope.eyepieceApparentFieldDeg, calculatedMagnification);
+    const calculatedExitPupil = exitPupilMm(telescope.apertureMm, calculatedMagnification);
+    return (<div className="app-shell">
+      <header className="topbar">
+        <a className="brand" href="#top" aria-label="Explorer Sense home"><span className="brand-mark">✳</span><span>EXPLORER <b>SENSE</b></span></a>
+        <div className="top-status"><span className={`status-dot ${cameraState === "ready" ? "live" : ""}`}/>{cameraState === "ready" ? "CAMERA LIVE" : "FIELD SETUP"}<span className="divider"/>{online ? "ONLINE" : "OFFLINE"}</div>
+      </header>
+
+      <main id="top" className="layout">
+        <section className="intro">
+          <div>
+            <p className="eyebrow">PUSH-TO TELESCOPE COMPANION</p>
+            <h1>Find your way<br /><em>through the sky.</em></h1>
+            <p className="lede">A camera-assisted observing workspace for a manually operated telescope. Measurements appear only when the hardware and data support them.</p>
+          </div>
+          <div className="session-chip"><span className="chip-icon">◷</span><span>{now.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}<br /><b>{now.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</b></span><small>LOCAL DEVICE TIME</small></div>
+        </section>
+
+        <nav className="tabs" aria-label="App sections">
+          <button className={tab === "guide" ? "active" : ""} onClick={() => setTab("guide")}>Live guide</button>
+          <button className={tab === "targets" ? "active" : ""} onClick={() => setTab("targets")}>Target library</button>
+          <button className={tab === "setup" ? "active" : ""} onClick={() => setTab("setup")}>Setup & diagnostics</button>
+        </nav>
+
+        {tab === "guide" && <>
+          <div className="main-grid">
+            <section className="panel camera-panel">
+              <div className="panel-heading"><div><p className="eyebrow">01 / SKY SCAN</p><h2>Camera view</h2></div><span className={`pill ${cameraState === "ready" ? "pill-live" : ""}`}>{cameraState === "ready" ? "LIVE" : "IDLE"}</span></div>
+              <div className="camera-view">
+                <video ref={videoRef} playsInline muted aria-label="Rear camera live preview"/>
+                {frameUrl && <img className="last-frame" src={frameUrl} alt="Most recent solve frame; after a plate solution, tap a known object here for calibration" onClick={selectCalibrationTarget}/>}
+                {calibrationMarker && <span className="picked-point" style={{ left: calibrationMarker.x, top: calibrationMarker.y }} aria-label="Selected calibration object"/>}
+                <div className="reticle"><span /></div>
+                <div className="camera-overlay"><span>{detection ? `${detection.stars.length} CANDIDATES` : "NO FRAME ANALYZED"}</span><span>{solution ? "ASTROMETRIC SOLUTION" : "NO PLATE SOLUTION"}</span></div>
+              </div>
+              <p className="muted status-line" role="status">{cameraMessage}</p>
+              <div className="button-row">
+                {cameraState === "ready" ? <button className="button secondary" onClick={stopCamera}>Stop camera</button> : <button className="button primary" onClick={() => void startCamera()} disabled={cameraState === "starting"}>{cameraState === "starting" ? "Requesting…" : "Enable rear camera"}</button>}
+                <button className="button secondary" onClick={() => void scanFrame()} disabled={cameraState !== "ready"}>Scan frame</button>
+              </div>
+              {detection && <div className="detection-line"><span>REAL FRAME ANALYSIS</span><b>{detection.stars.length} star-like sources</b><small>Background {detection.background.toFixed(1)} · threshold {detection.threshold.toFixed(1)} DN</small></div>}
+
+              <div className="online-solve">
+                <details>
+                  <summary>Optional online plate solve</summary>
+                  <p>Astrometry.net receives one still image only when you press Solve. An optional same-origin backend performs the API request so your API key stays server-side. For local use, start with <code>npm run dev:full</code> after setting <code>ASTROMETRY_API_KEY</code>. The app works without the backend, but online plate solving then remains unavailable.</p>
+                  <label className="check-label"><input type="checkbox" checked={uploadConsent} onChange={(event) => setUploadConsent(event.target.checked)}/> I understand this still frame will be uploaded to Astrometry.net for solving.</label>
+                  <button className="button primary" onClick={() => void solveFrame()} disabled={cameraState !== "ready" || solveBusy}>{solveBusy ? "Solving…" : "Upload still & solve"}</button>
+                </details>
+                <p className="muted status-line" role="status">{solveMessage}</p>
+              </div>
+              <canvas ref={canvasRef} className="hidden-canvas" aria-hidden="true"/>
+            </section>
+
+            <section className="panel target-panel">
+              <div className="panel-heading"><div><p className="eyebrow">02 / DESTINATION</p><h2>Selected target</h2></div><span className="target-kind">{(selected.objectType ?? selected.kind.replace("-", " ")).toUpperCase()}</span></div>
+              <div className="target-title"><div className="target-orb">✦</div><div><h3>{selected.name}</h3><p>{selected.summary}</p></div></div>
+              <div className="target-coords"><div><span>RIGHT ASCENSION</span><b>{targetEquatorial ? `${(targetEquatorial.ra * 15).toFixed(3)}°` : "N/A"}</b></div><div><span>DECLINATION</span><b>{targetEquatorial ? deg(targetEquatorial.dec) : "N/A"}</b></div></div>
+              {selected.aliases && selected.aliases.length > 0 && <p className="muted">Also cataloged as: {selected.aliases.filter((alias) => alias.toLocaleLowerCase() !== selected.id.toLocaleLowerCase() && alias !== selected.name).slice(0, 4).join(", ")}{selected.aliases.length > 5 ? " …" : ""}</p>}
+              {selected.kind === "deep-sky" && (selected.magnitude !== undefined || selected.surfaceBrightness !== undefined || selected.sizeMajorArcmin !== undefined || selected.constellation) && <div className="metrics-grid"><Metric label="V MAG" value={selected.magnitude == null ? "N/A" : selected.magnitude.toFixed(2)}/><Metric label="B SURF. BRIGHTNESS" value={selected.surfaceBrightness == null ? "N/A" : `${selected.surfaceBrightness.toFixed(2)} mag/arcsec²`}/><Metric label="MAJOR SIZE" value={selected.sizeMajorArcmin == null ? "N/A" : `${selected.sizeMajorArcmin.toFixed(1)}′`}/><Metric label="CONSTELLATION" value={selected.constellation ?? "N/A"}/></div>}
+              <button className="text-button" onClick={() => setTab("targets")}>Change target <span>↗</span></button>
+
+              <div className="rule"/>
+              <div className="panel-heading compact"><div><p className="eyebrow">03 / VISIBILITY</p><h2>Right now</h2></div><span className={`pill ${conditions ? "pill-live" : ""}`}>{conditions ? "CALCULATED" : "NO LOCATION"}</span></div>
+              {conditions ? <>
+                <div className="visibility-state"><span className="visibility-icon">◉</span><div><b>{conditions.status}</b><small>{conditions.status === "Below horizon" ? "Target is below the geometric horizon." : conditions.status === "Low altitude" ? "Near the horizon; atmospheric effects may be strong." : conditions.status === "Astronomical twilight" ? "Sun is above −18°; astronomical darkness has not begun." : "Target is above 20° and Sun is below −18°. This does not account for Moon, weather or light pollution."}</small></div></div>
+                <div className="metrics-grid"><Metric label="TARGET ALT." value={deg(conditions.targetAltitudeDeg)}/><Metric label="TARGET AZ." value={`${conditions.targetAzimuthDeg.toFixed(1)}°`}/><Metric label="MOON PHASE" value={moonPhaseName(conditions.moonPhaseAngleDeg)}/><Metric label="MOON ILLUM." value={`${conditions.moonIlluminationPercent.toFixed(0)}%`}/><Metric label="MOON ALT." value={deg(conditions.moonAltitudeDeg)}/><Metric label="MOON SEP." value={`${conditions.moonSeparationDeg.toFixed(1)}°`}/></div>
+                <details className="event-details"><summary>Rise, set, transit & twilight times · local</summary><div className="metrics-grid"><Metric label="TARGET RISE" value={localEventTime(conditions.targetRise)}/><Metric label="TARGET SET" value={localEventTime(conditions.targetSet)}/><Metric label="TARGET TRANSIT" value={localEventTime(conditions.targetTransit)}/><Metric label="MOON RISE / SET" value={`${localEventTime(conditions.moonRise)} / ${localEventTime(conditions.moonSet)}`}/><Metric label="SUN ALTITUDE" value={deg(conditions.sunAltitudeDeg)}/><Metric label="SUNRISE / SUNSET" value={`${localEventTime(conditions.sunRise)} / ${localEventTime(conditions.sunSet)}`}/><Metric label="CIVIL DAWN / DUSK" value={`${localEventTime(conditions.civilDawn)} / ${localEventTime(conditions.civilDusk)}`}/><Metric label="NAUTICAL DAWN / DUSK" value={`${localEventTime(conditions.nauticalDawn)} / ${localEventTime(conditions.nauticalDusk)}`}/><Metric label="ASTRO DAWN / DUSK" value={`${localEventTime(conditions.astronomicalDawn)} / ${localEventTime(conditions.astronomicalDusk)}`}/></div></details>
+                <div className="unknown-grid"><span>WEATHER <b>UNAVAILABLE</b></span><span>LIGHT POLLUTION <b>UNAVAILABLE</b></span></div>
+              </> : <div className="empty-state"><p>Location is needed for altitude, azimuth and visibility calculations.</p><button className="button secondary" onClick={requestLocation}>Allow location</button><small role="status">{locationMessage}</small></div>}
+            </section>
+          </div>
+
+          <section className="panel solution-panel">
+            <div className="panel-heading"><div><p className="eyebrow">04 / ASTROMETRIC STATUS</p><h2>{solution ? "Plate solution" : "Awaiting a real plate solution"}</h2></div><span className={`pill ${solution ? "pill-live" : ""}`}>{solution ? "SOLVED" : "NO SOLUTION"}</span></div>
+            {solution ? <div className="solution-content">
+              <div className="solution-coordinate"><span>RA</span><b>{(solution.raDeg / 15).toFixed(5)} h</b></div><div className="solution-coordinate"><span>DEC</span><b>{deg(solution.decDeg)}</b></div>
+              <div className="solution-coordinate"><span>FIELD WIDTH</span><b>≈ {fieldDegrees?.toFixed(2)}°</b></div><div className="solution-coordinate"><span>PIXEL SCALE</span><b>{solution.pixelScaleArcsec.toFixed(2)}″/px</b></div>
+              <div className="solution-note">Astrometry.net job {solution.jobId} · parity {solution.parity > 0 ? "+" : "−"} · orientation {solution.orientationDeg.toFixed(2)}°</div>
+              {targetPixel && Number.isFinite(targetPixel.x) && <div className="solution-note">Selected target projects to pixel {targetPixel.x.toFixed(0)}, {targetPixel.y.toFixed(0)} in this frame {targetPixel.x >= 0 && targetPixel.x <= solution.imageWidth && targetPixel.y >= 0 && targetPixel.y <= solution.imageHeight ? "(inside field)" : "(outside field)"}.</div>}
+            </div> : <div className="no-solution"><span className="crosshair">⌖</span><div><b>Coordinates are unavailable until an actual solve succeeds.</b><small>Local blind solving is not bundled. Online solve is optional and requires your Astrometry.net API key, internet access and an explicit image upload.</small></div></div>}
+            <div className="guide-result">
+              {!solution ? <><span className="guide-arrow">↗</span><div><b>Push-to guidance is locked</b><small>A valid plate solution and telescope-axis calibration are required. Phone compass orientation alone is not used.</small></div></> : !fit || fit.retainedIndexes.length < 5 ? <><span className="guide-arrow">◎</span><div><b>Calibration required</b><small>Add five or more solved calibration pairs across the sky; excluded outliers do not count. {Math.max(0, 5 - (fit?.retainedIndexes.length ?? 0))} more retained point{fit?.retainedIndexes.length === 4 ? "" : "s"} needed.</small></div></> : !validation ? <><span className="guide-arrow">◎</span><div><b>Independent validation required</b><small>Validate this fit against a fixed target that was not used during calibration.</small></div></> : validation.residualDeg > 0.5 ? <><span className="guide-arrow">!</span><div><b>Validation failed · recalibration required</b><small>Error {validation.residualDeg.toFixed(2)}°. The phone mount may have shifted. Repeat the calibration before relying on guidance.</small></div></> : !targetEquatorial ? <><span className="guide-arrow">◎</span><div><b>Target position unavailable</b><small>Allow location for the current topocentric position of this Solar System target.</small></div></> : guide?.directionAmbiguous ? <><span className="guide-arrow">!</span><div><b>Move direction is ambiguous</b><small>The target is almost exactly opposite the measured direction. Use a finder to move toward a closer sky region, then scan again.</small></div></> : guide ? <><span className="guide-arrow" style={!guide.centered ? { transform: `rotate(${Math.atan2(guide.eastErrorDeg, guide.northErrorDeg) * 180 / Math.PI}deg)` } : undefined}>{guide.centered ? "✓" : "↑"}</span><div><b>{guide.centered ? "TARGET CENTERED" : `Residual ${guide.residualDeg.toFixed(2)}°`}</b><small>{guide.centered ? `Measured residual ${guide.residualDeg.toFixed(2)}° is inside the 0.25° tolerance.` : `Measured from the calibrated scope direction. Move approximately ${Math.abs(guide.eastErrorDeg).toFixed(2)}° ${guide.eastErrorDeg >= 0 ? "east" : "west"} and ${Math.abs(guide.northErrorDeg).toFixed(2)}° ${guide.northErrorDeg >= 0 ? "north" : "south"} in the sky tangent plane, then scan again.`}</small></div></> : null}
+            </div>
+          </section>
+
+          <section className="panel calibration-panel">
+            <div className="panel-heading"><div><p className="eyebrow">05 / OPTICAL ALIGNMENT</p><h2>Precision calibration</h2></div><span className="pill">{calibrationPoints.length} POINT{calibrationPoints.length === 1 ? "" : "S"}</span></div>
+            <p className="panel-copy">The camera center and telescope optical axis are not assumed to align. Select a fixed catalog object, solve a frame, center that object in the eyepiece, and tap it in the solved image. The tap checks object identity against the WCS; the fit maps the camera center direction to the telescope-centered object direction.</p>
+            <div className="calibration-form"><div className="catalog-coordinate"><span>SELECTED TARGET</span><b>{selected.body || selected.raDeg === null || selected.decDeg === null ? `${selected.id} · fixed target required` : `${selected.id} · RA ${(selected.raDeg / 15).toFixed(5)} h · Dec ${deg(selected.decDeg)}`}</b></div><button className="button primary" onClick={addCalibrationPoint} disabled={!solution || !calibrationPixel || Boolean(selected.body)}>Add solved point</button></div>
+            <p className="muted">After a successful solve, tap the selected fixed target in the camera still. The marker confirms the point used to check object identity against the WCS.</p>
+            {selected.body && <p className="inline-warning">For calibration, select a fixed deep-sky target with known coordinates. Planetary positions move and are not accepted as fixed catalog directions.</p>}
+            {fit && <div className="calibration-quality"><div><span>MEAN / RMS</span><b>{fit.meanDeg.toFixed(3)}° / {fit.rmsDeg.toFixed(3)}°</b></div><div><span>WORST FIT RESIDUAL</span><b>{fit.worstDeg.toFixed(3)}°</b></div><div><span>POINTS FIT / TOTAL</span><b>{fit.retainedIndexes.length} / {fit.points.length}</b></div><div><span>FIT CHECK</span><b>{fit.retainedIndexes.length >= 5 && fit.rmsDeg < 0.25 ? "GOOD" : "PRELIMINARY"}</b></div></div>}
+            {fit && fit.retainedIndexes.length >= 5 && <div className="validation-row"><div><b>Independent validation</b><small>{validation ? `${validation.targetId} · ${validation.residualDeg.toFixed(2)}° residual` : "Choose an unused fixed target, solve a frame, and tap it in the image."}</small></div><button className="button secondary" onClick={validateCalibration} disabled={!solution || !calibrationPixel || Boolean(selected.body) || calibrationPoints.some((point) => point.label.startsWith(`${selected.id} `))}>Validate target</button></div>}
+            {calibrationPoints.length > 0 && <ul className="point-list">{calibrationPoints.map((point, index) => { const retained = !fit || fit.retainedIndexes.includes(index); const residual = fit ? angularSeparationDeg(rotateVector(fit.quaternion, point.camera), point.telescope) : null; return <li key={point.createdAt}><span>{index + 1}. {point.label}{!retained && <b className="point-warning">BAD CALIBRATION POINT · {residual?.toFixed(2)}° · REPEAT</b>}</span><button aria-label={`Remove point ${index + 1}`} onClick={() => removeCalibrationPoint(index)}>Remove</button></li>; })}</ul>}
+            {calibrationPoints.length > 0 && <button className="text-button clear-calibration" onClick={clearCalibration}>Clear calibration</button>}
+            <small className="muted">Calibration is saved on this device. Validate on an independent target. The app cannot directly detect a phone-to-telescope shift; clear and repeat calibration after any mount movement.</small>
+          </section>
+
+          <section className="panel equipment-panel">
+            <div className="panel-heading"><div><p className="eyebrow">06 / TELESCOPE</p><h2>Optics setup</h2></div></div>
+            <p className="muted">For the Sky-Watcher BK P15075 150/750 variant, the manufacturer lists 150 mm aperture and 750 mm focal length. Check the model label before applying it; other 150P variants differ. <a href="https://www.skywatcher.com/product/bk-p15075-eq3-wsteel-tripod/" target="_blank" rel="noreferrer">Manufacturer specifications</a></p>
+            <button className="button secondary" onClick={() => setTelescope((old) => ({ ...old, apertureMm: 150, focalLengthMm: 750 }))}>Use 150/750 preset</button>
+            <div className="equipment-fields"><NumberField label="Aperture" unit="mm" value={telescope.apertureMm} onChange={(value) => setTelescope((old) => ({ ...old, apertureMm: value }))}/><NumberField label="Focal length" unit="mm" value={telescope.focalLengthMm} onChange={(value) => setTelescope((old) => ({ ...old, focalLengthMm: value }))}/><NumberField label="Eyepiece" unit="mm" value={telescope.eyepieceMm} onChange={(value) => setTelescope((old) => ({ ...old, eyepieceMm: value }))}/><NumberField label="Eyepiece apparent field" unit="°" value={telescope.eyepieceApparentFieldDeg} onChange={(value) => setTelescope((old) => ({ ...old, eyepieceApparentFieldDeg: value }))}/></div>
+            <div className="magnification"><span>MAGNIFICATION</span><b>{calculatedMagnification ? `${calculatedMagnification.toFixed(1)}×` : "N/A"}</b><span>TRUE FIELD ≈</span><b>{trueFieldDegrees ? `${trueFieldDegrees.toFixed(2)}°` : "N/A"}</b><span>EXIT PUPIL</span><b>{calculatedExitPupil ? `${calculatedExitPupil.toFixed(2)} mm` : "N/A"}</b><small>Magnification = telescope focal length ÷ eyepiece focal length. True field uses apparent field ÷ magnification as an approximation.</small></div>
+          </section>
+        </>}
+
+        {tab === "targets" && <section className="panel library-panel">
+          <div className="panel-heading"><div><p className="eyebrow">OBJECT CATALOG</p><h2>Choose a destination</h2></div><span className="pill">{catalogState === "ready" ? `OPENNGC · ${catalogObjects.length.toLocaleString()} OBJECTS` : catalogState === "loading" ? "LOADING CATALOG" : catalogState === "error" ? "CATALOG ERROR" : "MESSIER STARTER SET"}</span></div>
+          <label className="search-field"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search M31, Orion, Jupiter…"/></label>
+          {catalogState === "loading" && <p className="muted" role="status">Loading the licensed offline NGC/IC catalog in a worker. The list will update when parsing finishes.</p>}
+          {catalogState === "error" && <div className="empty-state"><p>{catalogError}</p><button className="button secondary" onClick={() => { setCatalogError(""); setCatalogState("idle"); }}>Retry catalog load</button></div>}
+          <div className="target-list">{visibleTargets.map((target) => <button key={target.id} className={`target-row ${selected.id === target.id ? "selected" : ""}`} onClick={() => { setSelected(target); setTab("guide"); }}><span className="catalog-symbol">{target.kind === "planet" ? "●" : target.kind === "moon" ? "◐" : "✦"}</span><span><b>{target.name}</b><small>{target.summary}</small></span><span className="catalog-id">{target.id}</span></button>)}{matchingTargets.length === 0 && <p className="muted">No matching target in the loaded catalog.</p>}</div>
+          {matchingTargets.length > visibleTargets.length && <p className="muted">Showing {visibleTargets.length} of {matchingTargets.length.toLocaleString()} matches. Refine the search to narrow the list.</p>}
+          <p className="panel-copy">Fixed-object coordinates, aliases and available magnitudes/sizes come from the local OpenNGC catalog. Planet and Moon positions use current ephemerides. Coordinates do not imply visibility.</p>
+          <p className="muted">OpenNGC by Mattia Verga and contributors · CC BY-SA 4.0 · <a href="/catalog/README.md" target="_blank" rel="noreferrer">Catalog attribution and license</a></p>
+        </section>}
+
+        {tab === "setup" && <>
+          <section className="panel setup-panel">
+            <div className="panel-heading"><div><p className="eyebrow">FIELD SETUP</p><h2>Prepare the telescope</h2></div><span className="pill">MANUAL MOUNT</span></div>
+            <ol className="setup-steps"><li><b>Mount the phone securely.</b><span>Fix the iPhone 16e rigidly to the tube so it cannot rotate or slide. Recalibrate if the clamp moves.</span></li><li><b>Allow camera access.</b><span>Use Safari over HTTPS, then enable the rear camera from Live guide.</span></li><li><b>Allow location.</b><span>Location is requested only when you press Allow location. It stays in memory for this session.</span></li><li><b>Calibrate the optical offset.</b><span>Use several well-separated fixed targets. Center each target in the eyepiece while its sky frame is solved.</span></li><li><b>Rescan after every telescope movement.</b><span>The app does not claim the mount moved or the target centered without a new astrometric measurement.</span></li></ol>
+          </section>
+          <section className="panel diagnostics-panel">
+            <div className="panel-heading"><div><p className="eyebrow">COMPATIBILITY & LIMITATIONS</p><h2>Device diagnostics</h2></div></div>
+            <div className="diagnostics-list">{capabilityList.map((capability) => <div key={capability.name} className="diagnostic-row"><span className={`diagnostic-icon ${capability.state}`}>{capability.state === "available" ? "✓" : capability.state === "limited" ? "!" : "×"}</span><div><b>{capability.name}</b><small>{capability.detail}</small></div><span className="diagnostic-state">{capability.state.toUpperCase()}</span></div>)}</div>
+            <div className="limitations"><b>Unavailable data</b><p>Weather, seeing and light-pollution estimates are shown as unavailable. The app does not request those services or invent values. Safari camera exposure controls vary by device; a live video frame may not show enough stars for a solve.</p></div>
+          </section>
+          <section className="panel location-panel"><div className="panel-heading"><div><p className="eyebrow">LOCATION</p><h2>Observer position</h2></div></div><p className="panel-copy">Precise location is only requested after your action and is not saved.</p>{location && <div className="location-value"><span>AVAILABLE · ±{Math.round(location.accuracyMeters)} m accuracy</span><button className="text-button" onClick={() => { setLocation(null); setLocationMessage("Location cleared from this session."); }}>Clear</button></div>}<p className="muted status-line" role="status">{locationMessage}</p><button className="button secondary" onClick={requestLocation}>Request location</button></section>
+        </>}
+
+        <footer className="footer"><span>EXPLORER SENSE <b>0.1.0</b></span><span>ASTRONOMY WITHOUT GUESSWORK</span><span>LOCAL TIME {now.toLocaleTimeString()}</span></footer>
+      </main>
+    </div>);
+}
+function Metric({ label, value }) {
+    return <div className="metric"><span>{label}</span><b>{value}</b></div>;
+}
+function NumberField({ label, unit, value, onChange }) {
+    return <label>{label}<div className="unit-input"><input type="number" min="0" step="any" value={value ?? ""} onChange={(event) => onChange(event.target.value === "" ? null : Number(event.target.value))}/><span>{unit}</span></div></label>;
+}
+export { App };
