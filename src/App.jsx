@@ -36,6 +36,7 @@ function App() {
     const [locationMessage, setLocationMessage] = useState("Location not requested.");
     const [selected, setSelected] = useState(null);
     const [search, setSearch] = useState("");
+    const [targetCategory, setTargetCategory] = useState("all");
     const [solution, setSolution] = useState(null);
     const [solveMessage, setSolveMessage] = useState("No plate solution yet.");
     const [solveBusy, setSolveBusy] = useState(false);
@@ -56,7 +57,8 @@ function App() {
     const [catalogError, setCatalogError] = useState("");
     const [now, setNow] = useState(new Date());
     const matchingTargets = useMemo(() => searchTargets(search, catalogObjects), [search, catalogObjects]);
-    const visibleTargets = matchingTargets.slice(0, 50);
+    const categoryTargets = useMemo(() => targetCategory === "all" ? matchingTargets : matchingTargets.filter((target) => target.kind === targetCategory), [matchingTargets, targetCategory]);
+    const visibleTargets = categoryTargets.slice(0, 50);
     const conditions = useMemo(() => location && selected ? observingConditions(selected, location, now) : null, [location, selected, now]);
     const targetEquatorial = useMemo(() => {
         if (!selected)
@@ -505,10 +507,13 @@ function App() {
         {tab === "targets" && <section className="panel library-panel">
           <div className="panel-heading"><div><p className="eyebrow">OBJECT CATALOG</p><h2>Choose a destination</h2></div><span className="pill">{catalogState === "ready" ? `OPENNGC Â· ${catalogObjects.length.toLocaleString()} OBJECTS` : catalogState === "loading" ? "LOADING CATALOG" : catalogState === "error" ? "CATALOG ERROR" : "MESSIER STARTER SET"}</span></div>
           <label className="search-field"><span>âŒ•</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search M31, Orion, Jupiterâ€¦"/></label>
+          <div className="target-filters" role="group" aria-label="Filter targets">
+            {[{ id: "all", label: "All targets" }, { id: "deep-sky", label: "Deep sky" }, { id: "planet", label: "Planets" }, { id: "moon", label: "Moon" }].map((category) => <button key={category.id} className={targetCategory === category.id ? "active" : ""} onClick={() => setTargetCategory(category.id)}>{category.label}</button>)}
+          </div>
           {catalogState === "loading" && <p className="muted" role="status">Loading the licensed offline NGC/IC catalog in a worker. The list will update when parsing finishes.</p>}
           {catalogState === "error" && <div className="empty-state"><p>{catalogError}</p><button className="button secondary" onClick={() => { setCatalogError(""); setCatalogState("idle"); }}>Retry catalog load</button></div>}
-          <div className="target-list">{visibleTargets.map((target) => <button key={target.id} className={`target-row ${selected?.id === target.id ? "selected" : ""}`} onClick={() => { setSelected(target); setTab("guide"); }}><span className="catalog-symbol">{target.kind === "planet" ? "â—" : target.kind === "moon" ? "â—" : "âœ¦"}</span><span><b>{target.name}</b><small>{target.summary}</small></span><span className="catalog-id">{target.id}</span></button>)}{matchingTargets.length === 0 && <p className="muted">No matching target in the loaded catalog.</p>}</div>
-          {matchingTargets.length > visibleTargets.length && <p className="muted">Showing {visibleTargets.length} of {matchingTargets.length.toLocaleString()} matches. Refine the search to narrow the list.</p>}
+          <div className="target-list">{visibleTargets.map((target) => <button key={target.id} className={`target-row ${selected?.id === target.id ? "selected" : ""}`} onClick={() => { setSelected(target); setTab("guide"); }}><span className={`catalog-symbol ${target.kind}`}>{target.kind === "planet" ? "â—" : target.kind === "moon" ? "â—" : "âœ¦"}</span><span><b>{target.name}</b><small>{target.summary}</small></span><span className="catalog-id">{target.id}<small>VIEW IN AR</small></span></button>)}{categoryTargets.length === 0 && <p className="muted">No matching target in this category.</p>}</div>
+          {categoryTargets.length > visibleTargets.length && <p className="muted">Showing {visibleTargets.length} of {categoryTargets.length.toLocaleString()} matches. Refine the search to narrow the list.</p>}
           <p className="panel-copy">Fixed-object coordinates, aliases and available magnitudes/sizes come from the local OpenNGC catalog. Planet and Moon positions use current ephemerides. Coordinates do not imply visibility.</p>
           <p className="muted">OpenNGC by Mattia Verga and contributors Â· CC BY-SA 4.0 Â· <a href="/catalog/README.md" target="_blank" rel="noreferrer">Catalog attribution and license</a></p>
         </section>}
