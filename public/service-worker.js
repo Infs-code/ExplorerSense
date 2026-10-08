@@ -1,4 +1,4 @@
-const CACHE = "explorer-sense-shell-v4";
+const CACHE = "explorer-sense-shell-v5";
 const BASE = self.registration.scope;
 const SHELL = [BASE, new URL("manifest.webmanifest", BASE).href, new URL("icon.svg", BASE).href];
 
