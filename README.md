@@ -1,12 +1,15 @@
 # Explorer Sense
 
-Explorer Sense is a JavaScript/JSX mobile web app for turning a rigidly mounted phone camera into a manually operated telescope push-to aid. Its installed iPhone layout fills the screen with a live view, measured guidance, and thumb-friendly bottom navigation. It is designed for Safari without native iOS APIs.
+Explorer Sense is a JavaScript/JSX mobile web app for exploring the night sky from a phone. Its portrait view is a full-screen star chart with a compass heading, time and touch controls, plus a small live camera preview. It is designed for mobile browsers and can be added to the phone's home screen.
 
 ## Current implementation
 
 The app currently provides:
 
-- Rear-camera video through `getUserMedia`, with permission/error handling and a downscaled solve frame.
+- Front-camera video starts as the default after a user tap; a front/rear switch is available. The rear camera is required to scan or plate-solve the sky.
+- A full-screen portrait chart plots a curated set of bright stars and constellation lines. With location and an absolute device heading, stars are projected into the local horizon view; without those readings, the chart is labeled as a preview.
+- User-initiated device-orientation and motion access. The UI reports heading/tilt, accelerometer and gyroscope readings, and raw magnetometer values when the browser exposes them.
+- Location, local device time and explicit capability reporting. Location remains in memory for the session.
 - Installed PWA presentation with standalone display, iPhone safe-area support and a compact full-screen observing view.
 - Real image processing for compact bright-source detection: grayscale luminance, robust background/noise estimate, local maxima, centroid, flux, size, saturation rejection and signal-to-noise ranking. Detection runs in a Web Worker where supported.
 - An optional, user-initiated Astrometry.net API workflow. The user checks an upload disclosure and presses the solve button. A same-origin Node proxy keeps the Astrometry.net key server-side, and sends the still image privately (`publicly_visible: n`) to the service; the API returns a real field center, scale, orientation and parity.
@@ -23,11 +26,14 @@ The app currently provides:
 - Online solving requires an Astrometry.net API key, the optional Node proxy and internet. A static PWA deployment needs a same-origin `/api/solve` reverse-proxy route to the Node service. The app reports configuration and service errors instead of claiming a solve.
 - A phone's live video exposure may be too short to show enough stars, especially in city skies. Safari does not consistently expose camera shutter/ISO controls to web apps.
 - Calibration input uses fixed targets with catalog coordinates. Each point must be solved, centered in the eyepiece and tapped in the corresponding image. Use at least five widely separated targets, then validate on an unused target.
-- The app does not detect relative phone-to-telescope mount movement from motion sensors. A failed independent validation flags a possible shift and blocks guidance; after any physical phone shift, repeat calibration manually. The full-screen layout is inspired by telescope push-to apps, but this app does not copy AstroHopper's gyro-driven tracking behavior.
+- Device heading and motion are not a plate solution and do not prove target centering. The app currently shows a sensor-aligned 2D sky map, not camera-registered AR or AstroHopper-style calibrated telescope tracking.
+- Browser geolocation does not reveal whether the location came from GNSS, Wi-Fi or cellular networks, and it does not provide satellite data. Raw magnetometer and barometer readings are only shown if the browser exposes their sensor APIs.
+- Compass calibration is controlled by the operating system. Keep magnetic cases and accessories away; a figure-eight movement may help the phone recalibrate. The app cannot force recalibration.
+- Browser camera APIs do not expose optical image stabilization status or controls here. Actual stabilization is managed by the phone camera system.
 - Rescanning is user initiated after each telescope movement. The app does not yet schedule automatic movement-triggered solves.
 - The calibration response does not include a formal fit confidence or full WCS distortion terms. Field center and scale are the service's result; edge projection is approximate. A numeric solver confidence is therefore not shown.
 - No local weather, seeing or light-pollution data source is configured. Those fields remain `UNAVAILABLE`.
-- The UI has not been exercised on a physical iPhone 16e or in iPhone Safari during this implementation. Camera, installation and service behavior still need target-hardware validation.
+- The UI has not been exercised on a physical phone during this implementation. Camera, installation and sensor behavior still need target-hardware validation.
 - The offline catalog covers OpenNGC's NGC/IC objects and related Messier cross-references. It is not a complete Gaia/HIP/HD/WDS or minor-planet catalog. Fixed-object positions are J2000 catalog positions; planet and Moon ephemerides are calculated for the current time and observer.
 - Numeric sky-quality scores, filter support, object distances, and target-specific eyepiece recommendations are not implemented. OpenNGC provides V magnitude, B-band surface brightness, and angular size for some catalog entries; missing values are not inferred. The app reports actual geometry and events but does not rank targets using unavailable weather or light-pollution data.
 
