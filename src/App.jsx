@@ -12,6 +12,8 @@ import { solveThroughAstrometryProxy } from "./plateSolver/astrometryNet.js";
 import { pixelToSky, skyToPixel } from "./plateSolver/wcs.js";
 import { pointingGuidance } from "./pointing/guidance.js";
 import { deleteCalibration, loadCalibration, loadTelescopeConfig, saveCalibration, saveTelescopeConfig } from "./storage/local.js";
+import { requestDeviceSensors } from "./sensors/deviceSensors.js";
+import { SkyChart } from "./components/SkyChart.jsx";
 const capabilityList = browserCapabilities();
 const initialTarget = searchTargets("M31")[0];
 const deg = (value) => `${value >= 0 ? "+" : "−"}${Math.abs(value).toFixed(2)}°`;
@@ -21,9 +23,16 @@ function App() {
     const videoRef = useRef(null);
     const canvasRef = useRef(null);
     const streamRef = useRef(null);
+    const sensorCleanupRef = useRef(null);
     const abortRef = useRef(null);
     const [cameraState, setCameraState] = useState("idle");
+    const [cameraFacing, setCameraFacing] = useState("user");
     const [cameraMessage, setCameraMessage] = useState("Camera has not been requested.");
+    const [sensorData, setSensorData] = useState({ headingDeg: null, headingSource: "not enabled", tiltDeg: null, rollDeg: null, acceleration: null, rotationRate: null, magneticField: null, pressureRaw: null, motionAvailable: false, orientationAvailable: false, magneticAvailable: false, barometerAvailable: false });
+    const [sensorMessage, setSensorMessage] = useState("Tap Enable Device Orientation to request sensor access.");
+    const [orientationPromptOpen, setOrientationPromptOpen] = useState(true);
+    const [skyZoom, setSkyZoom] = useState(1);
+    const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
     const [location, setLocation] = useState(null);
     const [locationMessage, setLocationMessage] = useState("Location not requested.");
     const [selected, setSelected] = useState(initialTarget);
@@ -87,6 +96,7 @@ function App() {
             window.removeEventListener("online", updateOnline);
             window.removeEventListener("offline", updateOnline);
             streamRef.current?.getTracks().forEach((track) => track.stop());
+            sensorCleanupRef.current?.stop();
             abortRef.current?.abort();
         };
     }, []);
@@ -106,7 +116,7 @@ function App() {
         if (storageReady)
             void saveTelescopeConfig(telescope);
     }, [storageReady, telescope]);
-    async function startCamera() {
+    async function startCamera(facing = cameraFacing) {
         if (!navigator.mediaDevices?.getUserMedia) {
             setCameraState("error");
             setCameraMessage("Camera is unavailable. Open this app over HTTPS in a supported browser.");
@@ -117,7 +127,7 @@ function App() {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: false,
-                video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 15, max: 30 } },
+                video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 15, max: 30 } },
             });
             streamRef.current?.getTracks().forEach((track) => track.stop());
             streamRef.current = stream;
@@ -127,7 +137,8 @@ function App() {
             }
             setCameraState("ready");
             const track = stream.getVideoTracks()[0];
-            setCameraMessage(`Rear-camera stream active${track?.getSettings().width ? ` · ${track.getSettings().width}×${track.getSettings().height}` : ""}.`);
+            const actualFacing = track?.getSettings().facingMode ?? facing;
+            setCameraMessage(`${actualFacing === "user" ? "Front" : "Rear"}-camera stream active${track?.getSettings().width ? ` · ${track.getSettings().width}×${track.getSettings().height}` : ""}.`);
         }
         catch (error) {
             const name = error instanceof DOMException ? error.name : "Error";
@@ -155,6 +166,32 @@ function App() {
             setLocationMessage(`Location available · ±${Math.round(position.coords.accuracy)} m accuracy. Used in this session only.`);
         }, (error) => setLocationMessage(error.code === error.PERMISSION_DENIED ? "Location permission denied. Visibility calculations are unavailable." : "Location unavailable. Check device location settings and retry."), { enableHighAccuracy: true, maximumAge: 0, timeout: 15_000 });
     }
+    async function enableDeviceOrientation() {
+        requestLocation();
+        sensorCleanupRef.current?.stop();
+        setSensorMessage("Requesting orientation and motion access. Keep the phone away from magnetic cases while it starts.");
+        try {
+            const session = await requestDeviceSensors(setSensorData);
+            sensorCleanupRef.current = session;
+            setSensorMessage(session.permissionDenied ? "Sensor permission was denied. Enable Motion & Orientation Access in browser settings, then retry." : "Move the phone in a figure eight if the compass heading looks wrong. Phone sensors are guidance only; verify targets visually.");
+            setOrientationPromptOpen(false);
+        }
+        catch (error) {
+            setSensorMessage(error instanceof Error ? error.message : "Device sensors could not be started in this browser.");
+            setOrientationPromptOpen(false);
+        }
+    }
+    function switchCamera() {
+        const nextFacing = cameraFacing === "user" ? "environment" : "user";
+        setCameraFacing(nextFacing);
+        setFrameUrl(null);
+        setDetection(null);
+        setSolution(null);
+        if (cameraState === "ready") {
+            stopCamera();
+            void startCamera(nextFacing);
+        }
+    }
     async function captureFrame() {
         const video = videoRef.current;
         const canvas = canvasRef.current;
@@ -180,6 +217,10 @@ function App() {
         return { imageBase64: url, width, height, detection: stars };
     }
     async function scanFrame() {
+        if (cameraFacing !== "environment") {
+            setSolveMessage("Switch to the rear camera to scan the sky. The front camera is active for your requested selfie preview.");
+            return;
+        }
         const captured = await captureFrame();
         if (!captured) {
             setSolveMessage("Camera frame is not ready. Wait for live video, then scan again.");
@@ -188,6 +229,10 @@ function App() {
         setSolveMessage(`${captured.detection.stars.length} star-like sources detected in this frame. No plate solution has been attempted.`);
     }
     async function solveFrame() {
+        if (cameraFacing !== "environment") {
+            setSolveMessage("Switch to the rear camera before solving a sky image. The front camera points toward you.");
+            return;
+        }
         if (!uploadConsent) {
             setSolveMessage("Confirm the upload disclosure before sending a still frame.");
             return;
@@ -337,7 +382,7 @@ function App() {
         <div className="top-status"><span className={`status-dot ${cameraState === "ready" ? "live" : ""}`}/>{cameraState === "ready" ? "CAMERA LIVE" : "FIELD SETUP"}<span className="divider"/>{online ? "ONLINE" : "OFFLINE"}</div>
       </header>
 
-      <main id="top" className="layout">
+      <main id="top" className={`layout view-${tab} ${mobileToolsOpen ? "mobile-tools-open" : ""}`}>
         <section className="intro">
           <div>
             <p className="eyebrow">PUSH-TO TELESCOPE COMPANION</p>
@@ -358,7 +403,18 @@ function App() {
             <section className="panel camera-panel">
               <div className="panel-heading"><div><p className="eyebrow">01 / SKY SCAN</p><h2>Camera view</h2></div><span className={`pill ${cameraState === "ready" ? "pill-live" : ""}`}>{cameraState === "ready" ? "LIVE" : "IDLE"}</span></div>
               <div className="camera-view">
-                <video ref={videoRef} playsInline muted aria-label="Rear camera live preview"/>
+                <SkyChart location={location} date={now} headingDeg={sensorData.headingDeg} tiltDeg={sensorData.tiltDeg} zoom={skyZoom}/>
+                <div className="sky-controls">
+                  <button onClick={() => void enableDeviceOrientation()}>Align</button>
+                  <button onClick={() => setTab("targets")}>Search</button>
+                  <button aria-label="Open settings" onClick={() => { setMobileToolsOpen(false); setTab("setup"); }}>⚙</button>
+                </div>
+                <div className="sky-zoom-controls"><button aria-label="Zoom out" onClick={() => setSkyZoom((value) => Math.max(0.7, value - 0.2))}>−</button><span>{Math.round(60 / skyZoom)}°</span><button aria-label="Zoom in" onClick={() => setSkyZoom((value) => Math.min(2.5, value + 0.2))}>+</button></div>
+                <div className="sky-target-label">{selected.name}<small>{location ? sensorData.headingDeg === null ? "LIVE SKY · ALIGN COMPASS" : "LIVE LOCAL SKY · COMPASS ALIGNED" : "SKY MAP PREVIEW · ALLOW LOCATION"}</small></div>
+                <div className="sky-readout"><span>AZ {sensorData.headingDeg === null ? "--" : `${sensorData.headingDeg.toFixed(1)}°`}</span><span>TILT {sensorData.tiltDeg === null ? "--" : `${sensorData.tiltDeg.toFixed(0)}°`}</span><span>{now.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}</span></div>
+                <div className="sky-camera-controls"><button onClick={() => cameraState === "ready" ? stopCamera() : void startCamera()} disabled={cameraState === "starting"}>{cameraState === "ready" ? "Camera off" : cameraState === "starting" ? "Starting…" : `${cameraFacing === "user" ? "Front" : "Rear"} camera`}</button><button onClick={switchCamera} disabled={cameraState === "starting"}>{cameraFacing === "user" ? "Use rear" : "Use front"}</button><button onClick={() => void scanFrame()} disabled={cameraState !== "ready" || cameraFacing !== "environment"}>Scan</button></div>
+                <video className={`camera-pip ${cameraState === "ready" ? "active" : ""}`} ref={videoRef} playsInline muted aria-label={`${cameraFacing === "user" ? "Front" : "Rear"} camera preview`}/>
+                {orientationPromptOpen && <div className="orientation-prompt"><div><b>Enable Device Orientation</b><p>{sensorMessage}</p><button onClick={() => void enableDeviceOrientation()}>Enable Device Orientation</button></div></div>}
                 {frameUrl && <img className="last-frame" src={frameUrl} alt="Most recent solve frame; after a plate solution, tap a known object here for calibration" onClick={selectCalibrationTarget}/>}
                 {calibrationMarker && <span className="picked-point" style={{ left: calibrationMarker.x, top: calibrationMarker.y }} aria-label="Selected calibration object"/>}
                 <div className="reticle"><span /></div>
@@ -366,8 +422,9 @@ function App() {
               </div>
               <p className="muted status-line" role="status">{cameraMessage}</p>
               <div className="button-row">
-                {cameraState === "ready" ? <button className="button secondary" onClick={stopCamera}>Stop camera</button> : <button className="button primary" onClick={() => void startCamera()} disabled={cameraState === "starting"}>{cameraState === "starting" ? "Requesting…" : "Enable rear camera"}</button>}
-                <button className="button secondary" onClick={() => void scanFrame()} disabled={cameraState !== "ready"}>Scan frame</button>
+                {cameraState === "ready" ? <button className="button secondary" onClick={stopCamera}>Stop camera</button> : <button className="button primary" onClick={() => void startCamera()} disabled={cameraState === "starting"}>{cameraState === "starting" ? "Requesting…" : `Enable ${cameraFacing === "user" ? "front" : "rear"} camera`}</button>}
+                <button className="button secondary" onClick={switchCamera}>Use {cameraFacing === "user" ? "rear" : "front"} camera</button>
+                <button className="button secondary" onClick={() => void scanFrame()} disabled={cameraState !== "ready" || cameraFacing !== "environment"}>Scan frame</button>
               </div>
               {detection && <div className="detection-line"><span>REAL FRAME ANALYSIS</span><b>{detection.stars.length} star-like sources</b><small>Background {detection.background.toFixed(1)} · threshold {detection.threshold.toFixed(1)} DN</small></div>}
 
@@ -376,7 +433,7 @@ function App() {
                   <summary>Optional online plate solve</summary>
                   <p>Astrometry.net receives one still image only when you press Solve. An optional same-origin backend performs the API request so your API key stays server-side. For local use, start with <code>npm run dev:full</code> after setting <code>ASTROMETRY_API_KEY</code>. The app works without the backend, but online plate solving then remains unavailable.</p>
                   <label className="check-label"><input type="checkbox" checked={uploadConsent} onChange={(event) => setUploadConsent(event.target.checked)}/> I understand this still frame will be uploaded to Astrometry.net for solving.</label>
-                  <button className="button primary" onClick={() => void solveFrame()} disabled={cameraState !== "ready" || solveBusy}>{solveBusy ? "Solving…" : "Upload still & solve"}</button>
+                  <button className="button primary" onClick={() => void solveFrame()} disabled={cameraState !== "ready" || cameraFacing !== "environment" || solveBusy}>{solveBusy ? "Solving…" : "Upload still & solve"}</button>
                 </details>
                 <p className="muted status-line" role="status">{solveMessage}</p>
               </div>
@@ -451,7 +508,22 @@ function App() {
         {tab === "setup" && <>
           <section className="panel setup-panel">
             <div className="panel-heading"><div><p className="eyebrow">FIELD SETUP</p><h2>Prepare the telescope</h2></div><span className="pill">MANUAL MOUNT</span></div>
-            <ol className="setup-steps"><li><b>Mount the phone securely.</b><span>Fix the iPhone 16e rigidly to the tube so it cannot rotate or slide. Recalibrate if the clamp moves.</span></li><li><b>Allow camera access.</b><span>Use Safari over HTTPS, then enable the rear camera from Live guide.</span></li><li><b>Allow location.</b><span>Location is requested only when you press Allow location. It stays in memory for this session.</span></li><li><b>Calibrate the optical offset.</b><span>Use several well-separated fixed targets. Center each target in the eyepiece while its sky frame is solved.</span></li><li><b>Rescan after every telescope movement.</b><span>The app does not claim the mount moved or the target centered without a new astrometric measurement.</span></li></ol>
+            <ol className="setup-steps"><li><b>Mount the phone securely.</b><span>Fix the phone rigidly to the tube so it cannot rotate or slide. Recalibrate the optical offset if the clamp moves.</span></li><li><b>Allow camera access.</b><span>Use Safari over HTTPS. The front camera starts first; switch to the rear camera to scan or solve the sky.</span></li><li><b>Allow location.</b><span>Location is requested when you tap Align or Request location. It stays in memory for this session.</span></li><li><b>Calibrate the compass.</b><span>Keep the phone away from magnets and move it in a figure eight if heading drifts. Browser compass calibration is controlled by the device.</span></li><li><b>Calibrate the optical offset.</b><span>Use several well-separated fixed targets. Center each target in the eyepiece while its rear-camera sky frame is solved.</span></li></ol>
+          </section>
+          <section className="panel diagnostics-panel sensor-readings-panel">
+            <div className="panel-heading"><div><p className="eyebrow">LIVE PHONE SENSORS</p><h2>Device readings</h2></div><div className="button-row"><button className="button secondary" onClick={() => void enableDeviceOrientation()}>Refresh permission</button><button className="button secondary" onClick={() => { setMobileToolsOpen(true); setTab("guide"); }}>Optical calibration</button></div></div>
+            <p className="panel-copy" role="status">{sensorMessage}</p>
+            <div className="sensor-grid">
+              <Metric label="COMPASS HEADING" value={sensorData.headingDeg === null ? sensorData.headingSource : `${sensorData.headingDeg.toFixed(1)}° · ${sensorData.headingSource}`}/>
+              <Metric label="PHONE TILT / ROLL" value={`${sensorData.tiltDeg === null ? "N/A" : `${sensorData.tiltDeg.toFixed(1)}°`} / ${sensorData.rollDeg === null ? "N/A" : `${sensorData.rollDeg.toFixed(1)}°`}`}/>
+              <Metric label="ACCELERATION + GRAVITY" value={sensorData.acceleration ? `${sensorData.acceleration.x?.toFixed(2) ?? "--"}, ${sensorData.acceleration.y?.toFixed(2) ?? "--"}, ${sensorData.acceleration.z?.toFixed(2) ?? "--"} m/s²` : "Not exposed yet"}/>
+              <Metric label="GYROSCOPE RATE" value={sensorData.rotationRate ? `${sensorData.rotationRate.alpha?.toFixed(1) ?? "--"}, ${sensorData.rotationRate.beta?.toFixed(1) ?? "--"}, ${sensorData.rotationRate.gamma?.toFixed(1) ?? "--"} °/s` : "Not exposed yet"}/>
+              <Metric label="MAGNETIC FIELD" value={sensorData.magneticField ? `${sensorData.magneticField.x?.toFixed(1)}, ${sensorData.magneticField.y?.toFixed(1)}, ${sensorData.magneticField.z?.toFixed(1)} µT` : "Raw values unavailable"}/>
+              <Metric label="BAROMETER" value={sensorData.pressureRaw === null ? "Not exposed by browser" : `${sensorData.pressureRaw.toFixed(1)} raw units`}/>
+              <Metric label="GPS / GNSS" value={location ? `Location ±${Math.round(location.accuracyMeters)} m` : "Location not requested"}/>
+              <Metric label="PHONE TIME" value={now.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}/>
+            </div>
+            <div className="limitations"><b>Sensor and camera limits</b><p>Compass alignment depends on the phone's own calibration; this page cannot force recalibration. The browser provides a location estimate but no raw GNSS satellite list. This app draws a 2D sky overlay, not camera-registered AR. OIS status and controls are not exposed here. The star-map overlay is not an astrometric camera solve.</p></div>
           </section>
           <section className="panel diagnostics-panel">
             <div className="panel-heading"><div><p className="eyebrow">COMPATIBILITY & LIMITATIONS</p><h2>Device diagnostics</h2></div></div>
